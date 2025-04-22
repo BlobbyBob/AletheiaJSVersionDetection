@@ -1,0 +1,5 @@
+build
+.idea
+.venv
+dolospy/*.so
+dolospy.egg-info

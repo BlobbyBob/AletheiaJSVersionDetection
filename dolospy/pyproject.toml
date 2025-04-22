@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dolospy"
+version = "0.3.5"
+
+[tool.setuptools]
+packages = ["dolospy"]
+
+[tool.setuptools.package-data]
+dolospy = ["*.so*"]
+
+[tool.black]
+line-length = 120
+target-version = ["py312"]
