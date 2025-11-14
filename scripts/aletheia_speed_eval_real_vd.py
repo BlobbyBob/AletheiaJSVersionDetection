@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 import lzma
 import multiprocessing
 import multiprocessing.shared_memory
@@ -13,19 +14,10 @@ import bson
 import requests
 from tqdm import tqdm
 
-SHM_META_NAME = "dolos_speed_eval_meta"
-SHM_DATA_NAME = "dolos_speed_eval"
+SHM_META_NAME = "aletheia_speed_eval_meta"
+SHM_DATA_NAME = "aletheia_speed_eval"
 WORKER = multiprocessing.cpu_count()
-REQUIRES_SOURCE_MAP = False
-
-CDN_HOSTS = [
-    "//cdn.jsdelivr.net",
-    "//cdnjs.cloudflare.com",
-    "//unpkg.com",
-    "//ajax.googleapis.com",
-    "//ajax.aspnetcdn.com",
-    "//code.jquery.com",
-]
+ENDPOINT = "/identify/without_truths/compartments"
 
 class DocumentV2:
     """
@@ -77,24 +69,16 @@ def build_job_list_from_single_file(file) -> set:
             if not doc.has_error:
                 for resp in doc.data:
                     if doc.get_type(resp) == "js":
-                        skip_resp = False
-                        for cdn in CDN_HOSTS:
-                            if cdn in resp.get("url", ""):
-                                skip_resp = True
-                        if skip_resp:
-                            continue
-
                         source = resp.get("source")
                         sourcemap = resp.get("sourceMap")
 
-                        if REQUIRES_SOURCE_MAP and sourcemap is None:
+                        if sourcemap is None:
                             continue
 
                         assert type(source) is str, f"Source has unexpected type {type(source)}"
-                        resp_hash = f"{source}:{sourcemap if sourcemap is not None else ''}"
+                        resp_hash = f"{source}:{sourcemap}"
                         jobs.add(resp_hash)
 
-    print(f"{len(jobs)} jobs found in {file}")
     return jobs
 
 
@@ -120,11 +104,12 @@ def worker(
     shm_data = multiprocessing.shared_memory.SharedMemory(create=False, name=SHM_DATA_NAME)
 
     PORT = int(os.getenv("PORT", "6666")) + int(worker_id)
+    env = {**os.environ, "PORT": str(PORT)}
 
     server = None
 
-    def start_server():
-        srv = subprocess.Popen(["node", "identification/identify.mjs"], env={**os.environ, "PORT": str(PORT)})
+    try:
+        server = subprocess.Popen(["node", "identification/identify.mjs"], env=env)
         time.sleep(1)
 
         # Wait for server to start
@@ -134,10 +119,6 @@ def worker(
                 break
             except (ConnectionRefusedError, requests.Timeout, requests.ConnectionError):
                 time.sleep(0.5)
-        return srv
-
-    try:
-        server = start_server()
         print(f"Worker {worker_id}: Server started", file=sys.stderr)
 
         # noinspection PyTypeChecker
@@ -155,22 +136,34 @@ def worker(
             source_hash, sourcemap_hash = job.split(":")
 
             assert source_hash in index, f"source_hash not in object storage"
+            assert sourcemap_hash in index, f"source_hash not in object storage"
 
             try:
                 offset, size = index[source_hash]
                 # noinspection PyTypeChecker
                 source = lzma.decompress(shm_data.buf[offset:offset + size]).decode()
 
-                if len(sourcemap_hash) == 0:
-                    sourcemap = None
-                else:
-                    assert sourcemap_hash in index, f" {sourcemap_hash=} not in object storage"
-                    offset, size = index[sourcemap_hash]
-                    # noinspection PyTypeChecker
-                    sourcemap = lzma.decompress(shm_data.buf[offset:offset + size]).decode()
+                offset, size = index[sourcemap_hash]
+                # noinspection PyTypeChecker
+                sourcemap = lzma.decompress(shm_data.buf[offset:offset + size]).decode()
+
+                # Make sure it is a pnpm sourcemap
+                try:
+                    decoded_map = json.loads(sourcemap)
+                    sources = decoded_map["sources"]
+                    assert len([source for source in sources if "/.pnpm/" in source])
+                except (json.JSONDecodeError, KeyError, TypeError, AssertionError):
+                    result = {
+                        "id": job,
+                        "ignore": True,
+                    }
+                    with output_lock:
+                        with open(output_file, "ab") as f:
+                            f.write(bson.encode(result))
+                    continue
 
                 try:
-                    resp = requests.post(f"http://localhost:{PORT}/identify/without_truths/compartments", json={"source": source, "map": sourcemap})
+                    resp = requests.post(f"http://localhost:{PORT}{ENDPOINT}", json={"source": source, "map": sourcemap})
                     if resp.status_code >= 300:
                         if resp.status_code == 501:
                             # Tried to parse JSON => ignore
@@ -191,8 +184,7 @@ def worker(
                         with open(output_file, "ab") as f:
                             f.write(bson.encode(result))
                 except (requests.RequestException,):
-                    if server.poll() is not None:
-                        server = start_server()
+                    pass
 
             except (lzma.LZMAError, UnicodeDecodeError) as e:
                 print(f"Worker {worker_id}: Unexpected {type(e)} for {job}", file=sys.stderr)
@@ -206,7 +198,7 @@ def worker(
 
 
 def main():
-    global WORKER, REQUIRES_SOURCE_MAP
+    global WORKER, ENDPOINT
 
     shm_meta = None
     shm_data = None
@@ -238,10 +230,9 @@ def main():
         help=f"Amount of subprocesses used. Default: {WORKER}",
     )
     parser.add_argument(
-        "--requires-sourcemap",
-        dest="requires_sourcemap",
-        action="store_true",
-        help=f"Require sourcemap to be available. Default: {REQUIRES_SOURCE_MAP}",
+        "--endpoint",
+        type=str,
+        help=f"Endpoint to use for identify server. Default: {ENDPOINT}",
     )
     args = parser.parse_args()
 
@@ -250,34 +241,33 @@ def main():
     if args.worker:
         WORKER = args.worker
 
-    if args.requires_sourcemap:
-        REQUIRES_SOURCE_MAP = True
+    if args.endpoint:
+        ENDPOINT = args.endpoint
 
     try:
-
-        # Step 1: Build job list
-        print(f"Building job list from {len(args.files)} files", flush=True)
-        jobs = build_job_list(args.files)
-
         # Step 0: Load storage into mem
         FILESIZE = os.stat(args.object_storage).st_size
         shm_data = multiprocessing.shared_memory.SharedMemory(create=True, size=FILESIZE, name=SHM_DATA_NAME)
 
-        print(f"Reading {args.object_storage=} into RAM (this may take a while) ... ", flush=True)
+        print(f"Reading {args.object_storage=} into RAM (this may take a while) ... ")
         bs = 1024 * 1024
         with open(args.object_storage, mode="rb") as f:
             for offset in tqdm(range(0, FILESIZE, bs), unit="MByte", miniters=1500):
                 shm_data.buf[offset : offset + bs] = f.read(bs)
 
-        print(f"Building tar index (this may take a while) ... ", flush=True)
+        print(f"Building tar index (this may take a while) ... ")
         index = {}
         # noinspection PyTypeChecker
         with tarfile.open(fileobj=io.BytesIO(shm_data.buf), mode="r|") as tf:
             while (member := tf.next()) is not None:
                 index[member.name.rsplit("/", 1)[-1]] = (member.offset_data, member.size)
 
+        # Step 1: Build job list
+        print(f"Building job list from {len(args.files)} files")
+        jobs = build_job_list(args.files)
+
         # Step 2: Read output file and remove existing
-        print(f"Found {len(jobs)} jobs", flush=True)
+        print(f"Found {len(jobs)} jobs")
         try:
             with open(args.output, "rb") as f:
                 for result in bson.decode_file_iter(f):

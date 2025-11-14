@@ -2,8 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 
 import { File, LanguagePicker } from "@dodona/dolos-lib";
-import { deserializeFingerprintIndex } from "./dolos-serializer.mjs";
-import { findStrings } from "./find_candidate_strings.mjs";
+import { deserializeFingerprintIndex } from "./aletheia-serializer.mjs";
 import identifyBundler, { parseLoose } from "./identify_bundler.mjs";
 import {
     extractGroupedNpmModules,
@@ -12,7 +11,6 @@ import {
     identifyWebpackChunkCompartments,
     identifyWebpackCompartments,
 } from "./identify_compartments.mjs";
-import { identifyLibrariesByStrings, identifyLibrariesByStringsWithCompartments } from "./identify_libraries.mjs";
 import { MightBeJsonError } from "./utils.mjs";
 
 const languagePicker = new LanguagePicker();
@@ -149,63 +147,6 @@ async function main() {
                 switch (url.pathname) {
                     case "/alive":
                         return new Response("", { status: 200, statusText: "OK" });
-                    case "/identify":
-                    case "/identify/combined/compartments": {
-                        const { source, map } = body;
-                        const bundlers = [...new Set(identifyBundler(source, map).map((b) => b[0]))].filter(
-                            (b) => compartmentIdentification[b],
-                        );
-                        const { modules } =
-                            bundlers.length > 0 ? compartmentIdentification[bundlers[0]](source, map) : { modules: {} };
-                        const groundTruth = fetchPnpmVersions(map);
-                        if (wantsPnpm && groundTruth.length === 0) {
-                            return new Response(JSON.stringify({ libraries: [], similarities: {}, groundTruth }), {
-                                status: 200,
-                                statusText: "OK",
-                                headers: { "content-type": "application/json" },
-                            });
-                        }
-                        const libraries = await identifyLibrariesByStringsWithCompartments(source, modules);
-                        const nodeModules = extractGroupedNpmModules(modules);
-
-                        const similarities = await Promise.all(
-                            libraries.map((pkg) =>
-                                useCachedIndex(
-                                    [`${indexDir}/${pkg.replace("/", "+")}.index.json`],
-                                    nodeModules[pkg] ? nodeModules[pkg][1] : source,
-                                ),
-                            ),
-                        );
-                        return new Response(JSON.stringify({ libraries, similarities, groundTruth }), {
-                            status: 200,
-                            statusText: "OK",
-                            headers: { "content-type": "application/json" },
-                        });
-                    }
-                    case "/identify/combined/no_compartments": {
-                        const { source, map } = body;
-                        const groundTruth = fetchPnpmVersions(map);
-                        if (wantsPnpm && groundTruth.length === 0) {
-                            return new Response(JSON.stringify({ libraries: [], similarities: {}, groundTruth }), {
-                                status: 200,
-                                statusText: "OK",
-                                headers: { "content-type": "application/json" },
-                            });
-                        }
-                        const libraries = await identifyLibrariesByStrings(source);
-                        const similarities = await Promise.all(
-                            libraries
-                                .map((pkgVers) => pkgVers.rsplit(",", 1)[0])
-                                .map((pkg) =>
-                                    useCachedIndex([`${indexDir}/${pkg.replace("/", "+")}.index.json`], source),
-                                ),
-                        );
-                        return new Response(JSON.stringify({ libraries, similarities, groundTruth }), {
-                            status: 200,
-                            statusText: "OK",
-                            headers: { "content-type": "application/json" },
-                        });
-                    }
                     case "/identify/versions/compartments": {
                         const { source, map } = body;
                         const groundTruth = fetchPnpmVersions(map);
@@ -272,88 +213,6 @@ async function main() {
                             statusText: "OK",
                             headers: { "content-type": "application/json" },
                         });
-                    case "/identify/libraries/strings": {
-                        const { source, map } = body;
-                        const groundTruth = fetchNpmLibraries(map);
-                        if (!stringFingerprints) {
-                            stringFingerprints = new Set(
-                                Object.keys(
-                                    JSON.parse(
-                                        await fs.readFile(
-                                            process.env.STRING_FINGERPRINT_DB ?? "fingerprint_strings.json",
-                                            { encoding: "utf8" },
-                                        ),
-                                    ),
-                                ),
-                            );
-                            console.log("Length of fingerprint DB: ", stringFingerprints.size);
-                        }
-                        const strings = [...new Set(findStrings(parseLoose(source)))];
-                        const matchedFingerprints = strings
-                            .map((s) => crypto.hash("md5", s))
-                            .filter((h) => stringFingerprints.has(h));
-                        return new Response(JSON.stringify({ matchedFingerprints, groundTruth }), {
-                            status: 200,
-                            statusText: "OK",
-                            headers: { "content-type": "application/json" },
-                        });
-                    }
-                    case "/identify/libraries/strings/bycompartment": {
-                        const { source, map } = body;
-                        const groundTruth = fetchNpmLibraries(map);
-                        const bundlers = [...new Set(identifyBundler(source, map).map((b) => b[0]))].filter(
-                            (b) => compartmentIdentification[b],
-                        );
-                        const { modules, dependencies } =
-                            bundlers.length > 0
-                                ? compartmentIdentification[bundlers[0]](source, map)
-                                : {
-                                      modules: {},
-                                      dependencies: [],
-                                  };
-
-                        if (!stringFingerprints) {
-                            stringFingerprints = new Set(
-                                Object.keys(
-                                    JSON.parse(
-                                        await fs.readFile(
-                                            process.env.STRING_FINGERPRINT_DB ?? "fingerprint_strings.json",
-                                            { encoding: "utf8" },
-                                        ),
-                                    ),
-                                ),
-                            );
-                            console.log("Length of fingerprint DB: ", stringFingerprints.size);
-                        }
-
-                        if (Object.keys(modules).length > 0) {
-                            const matchedFingerprints = {};
-                            for (const [id, module] of Object.entries(modules)) {
-                                const strings = [...new Set(findStrings(module.ast))];
-                                matchedFingerprints[id] = strings
-                                    .map((s) => crypto.hash("md5", s))
-                                    .filter((h) => stringFingerprints.has(h));
-                            }
-                            return new Response(JSON.stringify({ matchedFingerprints, groundTruth }), {
-                                status: 200,
-                                statusText: "OK",
-                                headers: { "content-type": "application/json" },
-                            });
-                        } else {
-                            // Unknown bundle structure
-                            const strings = [...new Set(findStrings(parseLoose(source)))];
-                            const matchedFingerprints = {
-                                main: strings
-                                    .map((s) => crypto.hash("md5", s))
-                                    .filter((h) => stringFingerprints.has(h)),
-                            };
-                            return new Response(JSON.stringify({ matchedFingerprints, groundTruth }), {
-                                status: 200,
-                                statusText: "OK",
-                                headers: { "content-type": "application/json" },
-                            });
-                        }
-                    }
                     case "/identify/bundler-compartments": {
                         const { source, map } = body;
                         const bundlers = identifyBundler(source, map);
@@ -393,61 +252,6 @@ async function main() {
                             statusText: "OK",
                             headers: { "content-type": "application/json" },
                         });
-                    }
-                    case "/identify/without_truths/compartments": {
-                        const { source, map } = body;
-
-                        // Check if map is usable
-                        let mapUsable = true;
-                        try {
-                            const data = JSON.parse(map);
-                            if (!data.sources?.length) {
-                                mapUsable = false;
-                            }
-                        } catch (e) {
-                            mapUsable = false;
-                        }
-
-                        let libraries = [];
-                        let similarities = [];
-
-                        const bundlers = [
-                            ...new Set(identifyBundler(source, mapUsable ? map : undefined).map((b) => b[0])),
-                        ].filter((b) => compartmentIdentification[b]);
-                        const { modules } =
-                            bundlers.length > 0
-                                ? compartmentIdentification[bundlers[0]](source, mapUsable ? map : undefined)
-                                : { modules: {} };
-                        const nodeModules = extractGroupedNpmModules(modules);
-
-                        if (mapUsable) {
-                            Object.values(modules).forEach((m) => (delete m.ast, delete m.text));
-                            libraries = Object.keys(modules);
-                            similarities = await Promise.all(
-                                Object.entries(nodeModules).map((nm) =>
-                                    useCachedIndex([`${indexDir}/${nm[0].replace("/", "+")}.index.json`], nm[1]),
-                                ),
-                            );
-                        } else {
-                            libraries = await identifyLibrariesByStringsWithCompartments(source, modules);
-                            similarities = await Promise.all(
-                                libraries.map((pkg) =>
-                                    useCachedIndex(
-                                        [`${indexDir}/${pkg.replace("/", "+")}.index.json`],
-                                        nodeModules[pkg] ? nodeModules[pkg][1] : source,
-                                    ),
-                                ),
-                            );
-                        }
-
-                        return new Response(
-                            JSON.stringify({ similarities, libraries: Object.entries(nodeModules), mapUsable }),
-                            {
-                                status: 200,
-                                statusText: "OK",
-                                headers: { "content-type": "application/json" },
-                            },
-                        );
                     }
                     default:
                         return new Response(JSON.stringify({}), {
