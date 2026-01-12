@@ -54,4 +54,4 @@ As the implementation in their [Github repository](https://github.com/zenoj/Bund
 
 ### Datasets
 
-The datasets will be published soon. Currently, we are evaluating the best options for hosting.
+Check [datasets/README.md](datasets/README.md) for further information.
